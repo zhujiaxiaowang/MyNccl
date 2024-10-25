@@ -9,9 +9,11 @@ PREFIX ?= /usr/local
 VERBOSE ?= 0
 KEEP ?= 0
 DEBUG ?= 0
+ASAN ?= 0
 TRACE ?= 0
 PROFAPI ?= 1
 NVTX ?= 1
+RDMA_CORE ?= 0
 
 NVCC = $(CUDA_HOME)/bin/nvcc
 
@@ -84,6 +86,13 @@ NVCUFLAGS += -O0 -G -g
 CXXFLAGS  += -O0 -g -ggdb3
 endif
 
+# Make sure to run with ASAN_OPTIONS=protect_shadow_gap=0 otherwise CUDA will fail with OOM
+ifneq ($(ASAN), 0)
+CXXFLAGS += -fsanitize=address
+LDFLAGS += -fsanitize=address -static-libasan
+NVLDFLAGS += -Xcompiler -fsanitize=address,-static-libasan
+endif
+
 ifneq ($(VERBOSE), 0)
 NVCUFLAGS += -Xptxas -v -Xcompiler -Wall,-Wextra,-Wno-unused-parameter
 CXXFLAGS  += -Wall -Wextra
@@ -105,4 +114,8 @@ endif
 
 ifneq ($(PROFAPI), 0)
 CXXFLAGS += -DPROFAPI
+endif
+
+ifneq ($(RDMA_CORE), 0)
+CXXFLAGS += -DNCCL_BUILD_RDMA_CORE=1
 endif

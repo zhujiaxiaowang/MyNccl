@@ -10,8 +10,11 @@
 #include "transport.h"
 #include "p2p.h"
 #include "collectives.h"
+#include "nccl_tuner.h"
 #include "proxy.h"
 #include "strongstream.h"
+#include "nccl_net.h"
+#include "register.h"
 
 #if CUDART_VERSION < 9000
 struct cudaLaunchParams {
@@ -52,8 +55,7 @@ struct ncclRecvMem {
     struct {
       uint64_t tail;
       char pad1[CACHE_LINE_SIZE-sizeof(uint64_t)];
-      int sizesFifo[NCCL_STEPS];
-      int offsFifo[NCCL_STEPS];
+      struct ncclConnFifo connFifo[NCCL_STEPS];
       int flush; // For GDRCopy-based flush
     };
     char pad4[MEM_ALIGN];
@@ -96,17 +98,53 @@ struct ncclCommCallback {
   ncclResult_t(*fn)(struct ncclComm* comm, struct ncclCommCallback* cb);
 };
 
+struct ncclSharedResources {
+  int refCount;
+  struct ncclComm* owner; /* comm which creates this shared res. */
+  struct ncclChannelPeer* peers[MAXCHANNELS];
+  struct ncclDevChannelPeer* devPeers[MAXCHANNELS];
+  /* P2P operation counter, one per channel */
+  uint64_t p2pOpCount[MAXCHANNELS];
+  /* Collective operation counter */
+  uint64_t collOpCount;
+  int tpNRanks;
+  int tpNLocalRanks;
+  int tpNChannels;
+  int tpP2pNChannels;
+  int tpP2pChunkSize;
+  uint64_t magic;
+
+  // top parent rank to localRank translation table
+  int* tpRankToLocalRank;
+  // Internal streams
+  struct ncclStrongStream deviceStream, hostStream;
+
+  /* proxy related shared res */
+  struct ncclProxyState* proxyState;
+};
+
 struct ncclChannel {
-  struct ncclChannelPeer* peers;
-  struct ncclDevChannelPeer* devPeers;
+  struct ncclChannelPeer** peers;
+  struct ncclDevChannelPeer** devPeers;
+  /* devPeer pointer array used for host side access */
+  struct ncclDevChannelPeer** devPeersHostPtr;
   struct ncclRing ring;
   int* devRingUserRanks;
   struct ncclTree tree;
+
   struct ncclTree collnetChain;
   struct ncclDirect collnetDirect;
+
+  struct ncclNvls nvls;
+
   int id; // index of this channel
   uint32_t workFifoSent; // last used work index+1
-  uint64_t p2pOpCount;
+
+  /* comm split sharable resources */
+  struct ncclChannelPeer* collnetPeers;
+  struct ncclDevChannelPeer* collnetDevPeers;
+  struct ncclChannelPeer* nvlsPeers;
+  struct ncclDevChannelPeer* nvlsDevPeers;
 };
 
 struct ncclWorkList {
@@ -119,11 +157,18 @@ struct ncclPointerList {
   void *ptr;
 };
 
+struct ncclNvlsMcHandleList {
+  struct ncclNvlsMcHandleList *next;
+  CUmemGenericAllocationHandle mcHandle;
+  CUdeviceptr ptr;
+  int dev;
+  size_t size;
+};
+
 struct ncclKernelPlan {
   // A kernel plan is also a callback that reclaims itself. Hence this must
   // be the first member.
   struct ncclCommCallback reclaimer;
-  struct ncclMemoryPool memPool_ncclProxyOp; // memory to return to comm in cleanup
 
   struct ncclComm* comm;
   struct ncclKernelPlan* next;
@@ -142,6 +187,7 @@ struct ncclKernelPlan {
   int collOpCount; // zero based for this plan
 
   struct ncclIntruQueue<struct ncclPointerList, &ncclPointerList::next> ipcMemQueue;
+  struct ncclIntruQueue<struct ncclNvlsMcHandleList, &ncclNvlsMcHandleList::next> nvlsMcHandleQueue;
 
   struct Channel {
     int nWork;
@@ -153,6 +199,7 @@ struct ncclKernelPlan {
     struct ncclIntruQueue<struct ncclWorkList, &ncclWorkList::next> workQueue;
     struct ncclIntruQueue<struct ncclProxyOp, &ncclProxyOp::enqNext> proxyOpQueue;
   } channels[MAXCHANNELS];
+  size_t maxBytesPerChannel;
 };
 
 struct ncclComm {
@@ -160,6 +207,10 @@ struct ncclComm {
   // List of destructors to run when comm is destructed
   struct ncclDestructor* destructorHead;
 
+  struct ncclSharedResources* sharedRes;
+  /* map to top parent ranks. */
+  int* topParentRanks;
+  int* topParentLocalRanks;
   struct ncclChannel channels[MAXCHANNELS];
   struct ncclPeerInfo* peerInfo;
   struct ncclTopoSystem* topo;
@@ -173,12 +224,16 @@ struct ncclComm {
 
   uint64_t magic; // Magic number for all network communication. Not a security key -- only goal is to detect mismatches.
 
+  uint64_t commHash;
   int rank;    // my rank in the communicator
   int nRanks;  // number of GPUs in communicator
   int cudaDev; // my cuda device index
+  int nvmlDev; // my nvml device index
   int compCap; // compute capability of the GPU
+  int minCompCap, maxCompCap; // min/max compute capability in the communicator
   int64_t busId;   // my PCI bus ID in int format
   cpu_set_t cpuAffinity; // CPU affinity of the GPU
+  int cudaArch; // matches __CUDA_ARCH__ of device
 
   int node;
   int nNodes;
@@ -190,17 +245,19 @@ struct ncclComm {
   int* localRankToRank;
   // localRanks and localRanktoRank for all nodes
   struct ncclNodeRanks* nodeRanks;
+  int MNNVL; // MNNVL: Multi-Node NVLink
 
   bool checkPointers;
   bool dmaBufSupport;
 
   // Counter for tracking CUDA launches (P2P and collectives included)
   uint64_t opCount;
-  // Collective operation counter
-  uint64_t collOpCount;
 
   // Channels for collectives
-  int nChannels;
+  int nChannels; // connection nChannels
+  int collChannels; // enqueue nChannels
+  int nvlsChannels; // enqueue nChannels
+  int collNetChannels;
   // Channels (per peer) for p2p
   int p2pnChannels;
   int p2pnChannelsPerPeer;
@@ -217,6 +274,7 @@ struct ncclComm {
   ssize_t threadThresholds[NCCL_NUM_ALGORITHMS][NCCL_NUM_PROTOCOLS];
   float latencies[NCCL_NUM_FUNCTIONS][NCCL_NUM_ALGORITHMS][NCCL_NUM_PROTOCOLS];
   float bandwidths[NCCL_NUM_FUNCTIONS][NCCL_NUM_ALGORITHMS][NCCL_NUM_PROTOCOLS];
+  float ringbdw[NCCL_NUM_FUNCTIONS][NCCL_NUM_PROTOCOLS];
   int maxThreads[NCCL_NUM_ALGORITHMS][NCCL_NUM_PROTOCOLS];
 
   /* This attribute can indicate the states of communicators and return code of
@@ -225,6 +283,8 @@ struct ncclComm {
 
   // Flag to ask NCCL kernels to abort
   volatile uint32_t *abortFlag;
+  volatile uint32_t *childAbortFlag;
+  uint32_t *abortFlagRefCount;
 
   // Device side of the communicator (for cudaFree's)
   struct ncclDevComm* devComm; // actually = &ncclDevCommAndChannels::comm
@@ -251,21 +311,31 @@ struct ncclComm {
   char intraPad2[64 - sizeof(uint64_t)];
   uint64_t intraBarrierGate; // only used if this is intraComm0
 
-  struct ncclProxyState proxyState;
-
+  struct ncclProxyState* proxyState;
+  int proxyRefCountOld; /* store proxy post-atomic-sub refcount */
   // Whether this communicator uses collNet
   int collNetSupport;
+  uint8_t collNetSupportMatrix[4/*sum,prod,min,max*/][ncclNumTypes];
   int intraHighestTransportType;
+  int* collNetHeads;
+  int collNetHeadsNum;
+  int collNetHeadsUniqueNum;
+  int* collNetDenseToUserRank;
+  int* collNetUserToDenseRank;
+  /* sharable collNet proxy progress resource. */
+  struct ncclCollNetSharedRes* collNetSharedRes;
 
-  size_t channelSize; // User requested work size (bytes) for channel partitions
-
-  // Internal streams
-  struct ncclStrongStream deviceStream, hostStream;
+  // NVLink SHARP (NVLS) support
+  int nvlsSupport;
+  int nvlsRegSupport;
+  /* sharable NVLS resource. */
+  struct ncclNvlsSharedRes* nvlsResources;
 
   // pools backed by comm->memPermanent
   struct ncclMemoryPool memPool_ncclProxyOp;
   struct ncclMemoryPool memPool_ncclKernelPlan;
   struct ncclMemoryPool memPool_ncclPointerList;
+  struct ncclMemoryPool memPool_ncclNvlsHandleList;
   // Next comm in this thread's active ncclGroup[Start|End](). Holds "0x1" when
   // this comm is not yet in a group.
   struct ncclComm* groupNext;
@@ -286,14 +356,20 @@ struct ncclComm {
   // First of the unlaunched kernels in `planQueue`
   struct ncclKernelPlan* unlaunchedPlansHead;
 
-  // communicator mode
-  int blocking;
+  ncclConfig_t config;
   // initState is to more conveniently reclaim resources when errors happen.
   ncclResult_t initState;
   // flag to indicate if ncclCommFinalize() is called
   bool finalizeCalled;
   // shared structures for finalization
   int finalizeRankCnt;
+  // group job to support multi-thread FT
+  struct ncclGroupJob *groupJob;
+
+  // Tuning plugin
+  ncclTuner_t* tuner;
+  // buffer registration cache
+  struct ncclRegCache regCache;
 };
 
 enum ncclLaunchMode {

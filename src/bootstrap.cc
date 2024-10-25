@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include "proxy.h"
+#include "param.h"
 
 struct bootstrapRootArgs {
   struct ncclSocket* listenSock;
@@ -28,21 +29,24 @@ ncclResult_t bootstrapNetInit() {
   if (bootstrapNetInitDone == 0) {
     pthread_mutex_lock(&bootstrapNetLock);
     if (bootstrapNetInitDone == 0) {
-      char* env = getenv("NCCL_COMM_ID");
+      const char* env = ncclGetEnv("NCCL_COMM_ID");
       if (env) {
         union ncclSocketAddress remoteAddr;
         if (ncclSocketGetAddrFromString(&remoteAddr, env) != ncclSuccess) {
           WARN("Invalid NCCL_COMM_ID, please use format: <ipv4>:<port> or [<ipv6>]:<port> or <hostname>:<port>");
+          pthread_mutex_unlock(&bootstrapNetLock);
           return ncclInvalidArgument;
         }
         if (ncclFindInterfaceMatchSubnet(bootstrapNetIfName, &bootstrapNetIfAddr, &remoteAddr, MAX_IF_NAME_SIZE, 1) <= 0) {
           WARN("NET/Socket : No usable listening interface found");
+          pthread_mutex_unlock(&bootstrapNetLock);
           return ncclSystemError;
         }
       } else {
         int nIfs = ncclFindInterfaces(bootstrapNetIfName, &bootstrapNetIfAddr, MAX_IF_NAME_SIZE, 1);
         if (nIfs <= 0) {
           WARN("Bootstrap : no socket interface found");
+          pthread_mutex_unlock(&bootstrapNetLock);
           return ncclInternalError;
         }
       }
@@ -189,7 +193,7 @@ ncclResult_t bootstrapGetUniqueId(struct ncclBootstrapHandle* handle) {
   memset(handle, 0, sizeof(ncclBootstrapHandle));
   NCCLCHECK(getRandomData(&handle->magic, sizeof(handle->magic)));
 
-  char* env = getenv("NCCL_COMM_ID");
+  const char* env = ncclGetEnv("NCCL_COMM_ID");
   if (env) {
     INFO(NCCL_ENV, "NCCL_COMM_ID set by environment to %s", env);
     if (ncclSocketGetAddrFromString(&handle->addr, env) != ncclSuccess) {
@@ -217,6 +221,7 @@ struct bootstrapState {
   struct ncclSocket ringSendSocket;
   union ncclSocketAddress* peerCommAddresses;
   union ncclSocketAddress* peerProxyAddresses;
+  uint64_t* peerProxyAddressesUDS;
   struct unexConn* unexpectedConnections;
   int cudaDev;
   int rank;
@@ -291,6 +296,7 @@ ncclResult_t bootstrapInit(struct ncclBootstrapHandle* handle, struct ncclComm* 
 
   // Create the service proxy
   NCCLCHECK(ncclCalloc(&state->peerProxyAddresses, nranks));
+  NCCLCHECK(ncclCalloc(&state->peerProxyAddressesUDS, nranks));
 
   // proxy is aborted through a message; don't set abortFlag
   NCCLCHECK(ncclCalloc(&proxySocket, 1));
@@ -298,11 +304,90 @@ ncclResult_t bootstrapInit(struct ncclBootstrapHandle* handle, struct ncclComm* 
   NCCLCHECK(ncclSocketListen(proxySocket));
   NCCLCHECK(ncclSocketGetAddr(proxySocket, state->peerProxyAddresses+rank));
   NCCLCHECK(bootstrapAllGather(state, state->peerProxyAddresses, sizeof(union ncclSocketAddress)));
-  NCCLCHECK(ncclProxyInit(comm, proxySocket, state->peerProxyAddresses));
+  // cuMem UDS support
+  // Make sure we create a unique UDS socket name
+  uint64_t randId;
+  NCCLCHECK(getRandomData(&randId, sizeof(randId)));
+  state->peerProxyAddressesUDS[rank] = getPidHash()+randId;
+  NCCLCHECK(bootstrapAllGather(state, state->peerProxyAddressesUDS, sizeof(*state->peerProxyAddressesUDS)));
+  NCCLCHECK(ncclProxyInit(comm, proxySocket, state->peerProxyAddresses, state->peerProxyAddressesUDS));
 
   TRACE(NCCL_INIT, "rank %d nranks %d - DONE", rank, nranks);
 
   return ncclSuccess;
+}
+
+ncclResult_t bootstrapSplit(struct ncclBootstrapHandle* handle, struct ncclComm* comm, struct ncclComm* parent, int color, int key, int* parentRanks) {
+  ncclResult_t ret = ncclSuccess;
+  int rank = comm->rank;
+  int nranks = comm->nRanks;
+  int prev, next;
+  ncclSocketAddress listenAddr, tmpAddr;
+  struct ncclSocket* proxySocket;
+  struct bootstrapState* state;
+
+  NCCLCHECKGOTO(ncclCalloc(&state, 1), ret, fail);
+  state->rank = rank;
+  state->nranks = nranks;
+  state->abortFlag = comm->abortFlag;
+  comm->bootstrap = state;
+  comm->magic = state->magic = handle->magic;
+
+  prev = parentRanks[(rank-1+nranks)%nranks];
+  next = parentRanks[(rank+1)%nranks];
+
+  // Setup my sockets for the allgather ring and other p2p connections
+  NCCLCHECKGOTO(ncclSocketInit(&state->listenSock, &bootstrapNetIfAddr, comm->magic, ncclSocketTypeBootstrap, comm->abortFlag, 0), ret, fail);
+  NCCLCHECKGOTO(ncclSocketInit(&state->ringRecvSocket, NULL, comm->magic, ncclSocketTypeBootstrap, comm->abortFlag, 0), ret, fail);
+
+  // Create socket for other ranks to contact me
+  NCCLCHECKGOTO(ncclSocketListen(&state->listenSock), ret, fail);
+
+  // Get addr from next rank
+  NCCLCHECKGOTO(ncclSocketGetAddr(&state->listenSock, &listenAddr), ret, fail);
+  NCCLCHECKGOTO(bootstrapSend(parent->bootstrap, prev, -2, &listenAddr, sizeof(union ncclSocketAddress)), ret, fail);
+  NCCLCHECKGOTO(bootstrapRecv(parent->bootstrap, next, -2, &tmpAddr, sizeof(union ncclSocketAddress)), ret, fail);
+
+  NCCLCHECKGOTO(ncclSocketInit(&state->ringSendSocket, &tmpAddr, comm->magic, ncclSocketTypeBootstrap, comm->abortFlag, 0), ret, fail);
+  NCCLCHECKGOTO(ncclSocketConnect(&state->ringSendSocket), ret, fail);
+  // Accept the connect request from the previous rank in the AllGather ring
+  NCCLCHECKGOTO(ncclSocketAccept(&state->ringRecvSocket, &state->listenSock), ret, fail);
+
+  // AllGather all listen handlers
+  NCCLCHECKGOTO(ncclCalloc(&state->peerCommAddresses, nranks), ret, fail);
+  memcpy(state->peerCommAddresses+rank, &listenAddr, sizeof(union ncclSocketAddress));
+  NCCLCHECKGOTO(bootstrapAllGather(state, state->peerCommAddresses, sizeof(union ncclSocketAddress)), ret, fail);
+
+  if (parent->config.splitShare) {
+    /* map local rank to top parent local rank. */
+    for (int i = 0; i < nranks; ++i) {
+      comm->topParentRanks[i] = parent->topParentRanks[parentRanks[i]];
+    }
+  } else {
+    // Create the service proxy
+    NCCLCHECKGOTO(ncclCalloc(&state->peerProxyAddresses, nranks), ret, fail);
+    NCCLCHECKGOTO(ncclCalloc(&proxySocket, 1), ret, fail);
+    NCCLCHECKGOTO(ncclSocketInit(proxySocket, &bootstrapNetIfAddr, comm->magic, ncclSocketTypeProxy, comm->abortFlag, 0), ret, fail);
+    NCCLCHECKGOTO(ncclSocketListen(proxySocket), ret, fail);
+    NCCLCHECKGOTO(ncclSocketGetAddr(proxySocket, &tmpAddr), ret, fail);
+    memcpy(state->peerProxyAddresses + rank, &tmpAddr, sizeof(union ncclSocketAddress));
+    NCCLCHECKGOTO(bootstrapAllGather(state, state->peerProxyAddresses, sizeof(union ncclSocketAddress)), ret, fail);
+    // cuMem UDS support
+    NCCLCHECKGOTO(ncclCalloc(&state->peerProxyAddressesUDS, nranks), ret, fail);
+    // Make sure we create a unique UDS socket name
+    uint64_t randId;
+    NCCLCHECKGOTO(getRandomData(&randId, sizeof(randId)), ret, fail);
+    state->peerProxyAddressesUDS[rank] = getPidHash()+randId;
+    NCCLCHECKGOTO(bootstrapAllGather(state, state->peerProxyAddressesUDS, sizeof(*state->peerProxyAddressesUDS)), ret, fail);
+    NCCLCHECKGOTO(ncclProxyInit(comm, proxySocket, state->peerProxyAddresses, state->peerProxyAddressesUDS), ret, fail);
+  }
+
+  INFO(NCCL_INIT, "bootstrapSplit: comm %p parent %p rank %d nranks %d color %d key %d prev %d next %d - DONE", comm, parent, rank, nranks, color, key, prev, next);
+
+exit:
+  return ret;
+fail:
+  goto exit;
 }
 
 ncclResult_t bootstrapAllGather(void* commState, void* allData, int size) {
@@ -336,7 +421,7 @@ ncclResult_t bootstrapSend(void* commState, int peer, int tag, void* data, int s
   struct bootstrapState* state = (struct bootstrapState*)commState;
   struct ncclSocket sock;
 
-  NCCLCHECKGOTO(ncclSocketInit(&sock, state->peerCommAddresses+peer, state->magic, ncclSocketTypeBootstrap, state->abortFlag), ret, fail);
+  NCCLCHECKGOTO(ncclSocketInit(&sock, state->peerCommAddresses+peer, state->magic, ncclSocketTypeBootstrap), ret, fail);
   NCCLCHECKGOTO(ncclSocketConnect(&sock), ret, fail);
   NCCLCHECKGOTO(bootstrapNetSend(&sock, &state->rank, sizeof(int)), ret, fail);
   NCCLCHECKGOTO(bootstrapNetSend(&sock, &tag, sizeof(int)), ret, fail);
@@ -383,6 +468,24 @@ ncclResult_t bootstrapIntraNodeAllGather(void* commState, int *ranks, int rank, 
   }
 
   TRACE(NCCL_INIT, "rank %d nranks %d size %d - DONE", rank, nranks, size);
+  return ncclSuccess;
+}
+
+// IntraNode in-place Broadcast
+ncclResult_t bootstrapIntraNodeBroadcast(void* commState, int *ranks, int rank, int nranks, int root, void* bcastData, int size) {
+  if (nranks == 1) return ncclSuccess;
+  TRACE(NCCL_INIT, "rank %d nranks %d root %d size %d - ENTER", rank, nranks, root, size);
+
+  if (rank == root) {
+    for (int i=0; i<nranks; i++) {
+      if (i != root) NCCLCHECK(bootstrapSend(commState, ranks[i], /*tag=*/ranks[i], bcastData, size));
+    }
+  }
+  else {
+    NCCLCHECK(bootstrapRecv(commState, ranks[root], /*tag=*/ranks[rank], bcastData, size));
+  }
+
+  TRACE(NCCL_INIT, "rank %d nranks %d root %d size %d - DONE", rank, nranks, root, size);
   return ncclSuccess;
 }
 
@@ -478,7 +581,7 @@ ncclResult_t bootstrapClose(void* commState) {
   struct bootstrapState* state = (struct bootstrapState*)commState;
   if (state->unexpectedConnections != NULL) {
     unexpectedFree(state);
-    if (*state->abortFlag == 0) {
+    if (__atomic_load_n(state->abortFlag, __ATOMIC_RELAXED) == 0) {
       WARN("Unexpected connections are not empty");
       return ncclInternalError;
     }
@@ -502,6 +605,7 @@ ncclResult_t bootstrapAbort(void* commState) {
   NCCLCHECK(ncclSocketClose(&state->ringRecvSocket));
   free(state->peerCommAddresses);
   free(state->peerProxyAddresses);
+  free(state->peerProxyAddressesUDS);
   free(state);
   return ncclSuccess;
 }
